@@ -19,15 +19,19 @@ const (
 
 // TraceEvent is the JSON payload appended to agent_traces.events.
 type TraceEvent struct {
-	Timestamp  time.Time `json:"timestamp"`
-	EventType  string    `json:"event_type"`
-	NodeID     string    `json:"node_id,omitempty"`
-	Attempt    int       `json:"attempt,omitempty"`
-	ToolName   string    `json:"tool_name,omitempty"`
-	DurationMs int64     `json:"duration_ms,omitempty"`
-	TokenIn    int       `json:"token_in,omitempty"`
-	TokenOut   int       `json:"token_out,omitempty"`
-	Error      string    `json:"error,omitempty"`
+	Timestamp      time.Time         `json:"timestamp"`
+	EventType      string            `json:"event_type"`
+	NodeID         string            `json:"node_id,omitempty"`
+	Attempt        int               `json:"attempt,omitempty"`
+	ToolName       string            `json:"tool_name,omitempty"`
+	DurationMs     int64             `json:"duration_ms,omitempty"`
+	TokenIn        int               `json:"token_in,omitempty"`
+	TokenOut       int               `json:"token_out,omitempty"`
+	Error          string            `json:"error,omitempty"`
+	StateSnapshot  map[string]string `json:"state_snapshot,omitempty"`
+	OutputPreview  string            `json:"output_preview,omitempty"`
+	InputsUsed     map[string]string `json:"inputs_used,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 }
 
 // Emitter decouples trace emission from trace persistence via a buffered channel.
@@ -168,10 +172,15 @@ func (e *ExecutorEmitter) Emit(ctx context.Context, runID string, ev agent.Trace
 		eventType = mapTransitionEventType(ev.ToState)
 	}
 	traceEvent := TraceEvent{
-		Timestamp: ev.At,
-		EventType: eventType,
-		NodeID:    ev.NodeID,
-		Attempt:   ev.Attempt,
+		Timestamp:      ev.At,
+		EventType:      eventType,
+		NodeID:         ev.NodeID,
+		Attempt:        ev.Attempt,
+		DurationMs:     ev.DurationMs,
+		StateSnapshot:  ev.StateSnapshot,
+		OutputPreview:  ev.OutputPreview,
+		InputsUsed:     ev.InputsUsed,
+		IdempotencyKey: ev.IdempotencyKey,
 	}
 	if ev.ToState == string(agent.NodeStatusFailed) || eventType == "provider_fallback" {
 		traceEvent.Error = ev.Message

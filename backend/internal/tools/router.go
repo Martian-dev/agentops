@@ -259,7 +259,7 @@ func (r *Router) dispatchLLM(ctx context.Context, tool *Tool, inputs map[string]
 		return nil, fmt.Errorf("llm handler failed for tool=%s: %w", tool.Name, err)
 	}
 
-	return map[string]string{"output": output}, nil
+	return map[string]interface{}{"output": output}, nil
 }
 
 func validateInput(tool *Tool, inputs map[string]interface{}) error {

@@ -369,6 +369,12 @@ func (h *Handler) RunAgent(c *fiber.Ctx) error {
 
 // executeRun is the background goroutine for the full plan→execute lifecycle.
 func (h *Handler) executeRun(ctx context.Context, cancel context.CancelFunc, runID, goal string, agentTools []Tool, modelCfg ModelConfig) {
+	h.executeRunWithCheckpoint(ctx, cancel, runID, goal, agentTools, modelCfg, nil)
+}
+
+// executeRunWithCheckpoint handles the full plan→execute lifecycle, optionally
+// resuming from a prior checkpoint.
+func (h *Handler) executeRunWithCheckpoint(ctx context.Context, cancel context.CancelFunc, runID, goal string, agentTools []Tool, modelCfg ModelConfig, checkpoint *Checkpoint) {
 	defer func() {
 		h.activeCancels.Delete(runID)
 		h.runStates.Delete(runID)
@@ -377,11 +383,12 @@ func (h *Handler) executeRun(ctx context.Context, cancel context.CancelFunc, run
 
 	finalStatus := "failed"
 	var tokenTotal int64
+	var execResult *ExecutionResult
 
 	defer func() {
 		updateCtx, updateCancel := context.WithTimeout(context.Background(), queryTimeout)
 		defer updateCancel()
-		
+
 		var nodeOutputsJSON []byte
 		if v, ok := h.runStates.Load(runID); ok {
 			live := v.(*liveRunState)
@@ -390,35 +397,65 @@ func (h *Handler) executeRun(ctx context.Context, cancel context.CancelFunc, run
 			}
 		}
 
+		// Save checkpoint data and execution metadata
+		var checkpointJSON []byte
+		var execMetadataJSON []byte
+		if execResult != nil {
+			if execResult.Checkpoint != nil {
+				checkpointJSON, _ = execResult.Checkpoint.Marshal()
+			}
+			if len(execResult.Deltas) > 0 {
+				execMetadataJSON, _ = json.Marshal(map[string]interface{}{
+					"deltas":       execResult.Deltas,
+					"total_tokens": execResult.TotalTokens,
+				})
+			}
+		}
+
 		_, err := h.pool.Exec(updateCtx, `
 			UPDATE agent_runs
-			SET status = $1, completed_at = now(), token_total = $2, node_outputs = $4::jsonb
+			SET status = $1, completed_at = now(), token_total = $2,
+			    node_outputs = $4::jsonb, checkpoint_data = $5::jsonb,
+			    execution_metadata = $6::jsonb
 			WHERE id = $3::uuid
-		`, finalStatus, tokenTotal, runID, nodeOutputsJSON)
+		`, finalStatus, tokenTotal, runID, nodeOutputsJSON, checkpointJSON, execMetadataJSON)
 		if err != nil {
 			log.Printf("ERROR: failed to update run %s status: %v", runID, err)
 		}
 	}()
 
-	// Planner
-	if h.planner == nil {
-		log.Printf("ERROR: run %s failed: planner not configured", runID)
-		return
-	}
-	plan, err := h.planner.Plan(ctx, goal, agentTools)
-	if err != nil {
-		log.Printf("ERROR: run %s planning failed: %v", runID, err)
-		return
-	}
+	var plan *DAGPlan
 
-	// Save DAG plan to DB
-	planJSON, err := json.Marshal(plan)
-	if err == nil {
-		updateCtx, updateCancel := context.WithTimeout(context.Background(), queryTimeout)
-		_, _ = h.pool.Exec(updateCtx, `
-			UPDATE agent_runs SET dag_plan = $1::jsonb WHERE id = $2::uuid
-		`, planJSON, runID)
-		updateCancel()
+	if checkpoint != nil {
+		// Resume from checkpoint — restore the plan
+		var err error
+		plan, err = checkpoint.RestorePlan()
+		if err != nil {
+			log.Printf("ERROR: run %s failed to restore plan from checkpoint: %v", runID, err)
+			return
+		}
+	} else {
+		// Fresh run — generate plan via planner
+		if h.planner == nil {
+			log.Printf("ERROR: run %s failed: planner not configured", runID)
+			return
+		}
+		var err error
+		plan, err = h.planner.Plan(ctx, goal, agentTools)
+		if err != nil {
+			log.Printf("ERROR: run %s planning failed: %v", runID, err)
+			return
+		}
+
+		// Save DAG plan to DB
+		planJSON, err := json.Marshal(plan)
+		if err == nil {
+			updateCtx, updateCancel := context.WithTimeout(context.Background(), queryTimeout)
+			_, _ = h.pool.Exec(updateCtx, `
+				UPDATE agent_runs SET dag_plan = $1::jsonb WHERE id = $2::uuid
+			`, planJSON, runID)
+			updateCancel()
+		}
 	}
 
 	// Build tool names for validation
@@ -458,19 +495,18 @@ func (h *Handler) executeRun(ctx context.Context, cancel context.CancelFunc, run
 	}
 	h.runStates.Store(runID, live)
 
-	// Execute
-	states, execErr := executor.Execute(ctx, runID, plan)
+	// Execute with full result (includes deltas, checkpoint)
+	var execErr error
+	execResult, execErr = executor.ExecuteWithResult(ctx, runID, plan, checkpoint)
 
 	// Update live state with final node states and extract outputs
-	outMap := make(map[string]interface{})
-	if states != nil {
-		for id, state := range states {
+	if execResult != nil && execResult.FinalStates != nil {
+		for id, state := range execResult.FinalStates {
 			live.nodeStates[id] = string(state.Status)
 			if len(state.Output) > 0 {
 				var parsed interface{}
 				if err := json.Unmarshal([]byte(state.Output), &parsed); err == nil {
 					live.nodeOutputs[id] = parsed
-					outMap[id] = parsed
 				}
 			}
 		}
@@ -491,6 +527,111 @@ func (h *Handler) executeRun(ctx context.Context, cancel context.CancelFunc, run
 	}
 
 	finalStatus = "success"
+}
+
+// ResumeRun handles POST /agents/:id/runs/:run_id/resume — resumes a failed
+// run from its last checkpoint.
+func (h *Handler) ResumeRun(c *fiber.Ctx) error {
+	if h.pool == nil {
+		return writeError(c, fiber.StatusServiceUnavailable, "db_unavailable", "database connection not initialized")
+	}
+
+	agentID := strings.TrimSpace(c.Params("id"))
+	if _, err := uuid.Parse(agentID); err != nil {
+		return writeError(c, fiber.StatusBadRequest, "validation_error", "agent id must be a valid UUID")
+	}
+
+	runID := strings.TrimSpace(c.Params("run_id"))
+	if _, err := uuid.Parse(runID); err != nil {
+		return writeError(c, fiber.StatusBadRequest, "validation_error", "run_id must be a valid UUID")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+
+	// Load the run and verify it failed
+	var status string
+	var goalPtr *string
+	var checkpointData []byte
+	var modelConfigText string
+	err := h.pool.QueryRow(ctx, `
+		SELECT ar.status, ar.goal, ar.checkpoint_data,
+		       COALESCE(a.model_config, '{}'::jsonb)::text
+		FROM agent_runs ar
+		JOIN agents a ON a.id = ar.agent_id
+		WHERE ar.id = $1::uuid AND ar.agent_id = $2::uuid
+	`, runID, agentID).Scan(&status, &goalPtr, &checkpointData, &modelConfigText)
+	if err != nil {
+		return writeError(c, fiber.StatusNotFound, "not_found", "run not found")
+	}
+
+	if status != "failed" {
+		return writeError(c, fiber.StatusBadRequest, "invalid_state", "only failed runs can be resumed")
+	}
+
+	if len(checkpointData) == 0 {
+		return writeError(c, fiber.StatusBadRequest, "no_checkpoint", "run has no checkpoint data to resume from")
+	}
+
+	checkpoint, err := UnmarshalCheckpoint(checkpointData)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, "checkpoint_error", "failed to load checkpoint")
+	}
+
+	goal := ""
+	if goalPtr != nil {
+		goal = *goalPtr
+	}
+
+	// Load agent tools
+	var agentObj Agent
+	var agentModelConfigText string
+	err = h.pool.QueryRow(ctx, `
+		SELECT
+			id::text,
+			name,
+			COALESCE((SELECT array_agg(t::text) FROM unnest(tool_ids) AS t), '{}'::text[]),
+			COALESCE(model_config, '{}'::jsonb)::text,
+			active_version,
+			created_at
+		FROM agents
+		WHERE id = $1::uuid
+	`, agentID).Scan(
+		&agentObj.ID, &agentObj.Name, &agentObj.ToolIDs,
+		&agentModelConfigText, &agentObj.ActiveVersion, &agentObj.CreatedAt,
+	)
+	if err != nil {
+		return writeError(c, fiber.StatusNotFound, "not_found", "agent not found")
+	}
+	agentObj.ModelConfig = json.RawMessage(agentModelConfigText)
+
+	agentTools, err := h.getToolsByIDs(ctx, agentObj.ToolIDs)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, "internal_error", "failed to load agent tools")
+	}
+
+	modelCfg := ParseModelConfig(agentObj.ModelConfig)
+
+	// Reset run status to running
+	_, err = h.pool.Exec(ctx, `
+		UPDATE agent_runs SET status = 'running', completed_at = NULL WHERE id = $1::uuid
+	`, runID)
+	if err != nil {
+		return writeError(c, fiber.StatusInternalServerError, "internal_error", "failed to update run status")
+	}
+
+	// Launch async goroutine with checkpoint
+	runCtx, runCancel := context.WithTimeout(context.Background(), maxRunDuration)
+	h.activeCancels.Store(runID, runCancel)
+
+	go h.executeRunWithCheckpoint(runCtx, runCancel, runID, goal, agentTools, modelCfg, checkpoint)
+
+	return writeSuccess(c, fiber.StatusAccepted, fiber.Map{
+		"run_id":  runID,
+		"resumed": true,
+		"checkpoint_tiers_completed": checkpoint.CompletedTiers,
+		"checkpoint_nodes_completed": len(checkpoint.CompletedNodes),
+	})
 }
 
 // GetRunStatus handles GET /runs/:id/status — Step 10c.
@@ -581,6 +722,7 @@ func (h *Handler) GetRunStatus(c *fiber.Ctx) error {
 		Status:        status,
 		CompletionPct: 100,
 		NodeStates:    nodeStates,
+		NodeOutputs:   nodeOutputs,
 		TokenTotal:    tokenTotal,
 		ElapsedMs:     elapsedMs,
 	})

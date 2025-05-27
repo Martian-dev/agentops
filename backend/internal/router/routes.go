@@ -31,6 +31,7 @@ func SetupRoutes(app *fiber.App, toolRouter *tools.Router, traceEmitter *trace.E
 	// Run endpoints
 	v1.Get("/runs/:id/status", agentHandler.GetRunStatus)
 	v1.Get("/runs/:id/trace", agentHandler.GetRunTrace)
+	v1.Post("/agents/:id/runs/:run_id/resume", agentHandler.ResumeRun)
 
 	// Tool registry endpoints
 	v1.Post("/tools", toolHandler.CreateTool)

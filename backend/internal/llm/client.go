@@ -19,8 +19,8 @@ const (
 	defaultGeminiURL     = "https://generativelanguage.googleapis.com/v1beta/models"
 	defaultHTTPTimeout   = 20 * time.Second
 
-	defaultOpenRouterModel = "google/gemini-2.0-flash-001"
-	defaultGeminiModel     = "gemini-2.0-flash"
+	defaultOpenRouterModel = "google/gemini-2.5-flash"
+	defaultGeminiModel     = "gemini-2.5-flash"
 )
 
 // LLMClient is a provider-agnostic interface for text completion.
@@ -127,6 +127,7 @@ func (c *OpenRouterClient) Complete(ctx context.Context, systemPrompt, userMessa
 	body, err := json.Marshal(map[string]interface{}{
 		"model":       model,
 		"temperature": temp,
+		"max_tokens":  4000,
 		"messages": []map[string]string{
 			{"role": "system", "content": systemPrompt},
 			{"role": "user", "content": userMessage},

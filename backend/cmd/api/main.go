@@ -1,8 +1,6 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"log"
 	"os"
 
@@ -37,18 +35,17 @@ func main() {
 	})
 
 	toolRouter := tools.NewRouter(db.Pool, nil)
-	toolRouter.Register("echo", func(ctx context.Context, inputs map[string]interface{}) (interface{}, error) {
-		msg, ok := inputs["message"].(string)
-		if !ok {
-			return nil, fmt.Errorf("message must be a string")
-		}
-		return map[string]interface{}{"output": msg}, nil
-	})
-	toolRouter.Register("concat", func(ctx context.Context, inputs map[string]interface{}) (interface{}, error) {
-		a, _ := inputs["a"].(string)
-		b, _ := inputs["b"].(string)
-		return map[string]interface{}{"output": a + " " + b}, nil
-	})
+	// -------------------------------------------------------------------------
+	// Core Internal Tools
+	// -------------------------------------------------------------------------
+	// Register native Go-based tools here (e.g. file system operations,
+	// direct database queries, specialized formatting) using:
+	//
+	// toolRouter.Register("find", func(ctx context.Context, inputs map[string]interface{}) (interface{}, error) {
+	// 	// ... implementation ...
+	// 	return map[string]interface{}{"result": []string{"file1.txt"}}, nil
+	// })
+	// -------------------------------------------------------------------------
 
 	// Create trace emitter for run execution
 	traceEmitter := trace.NewExecutorEmitter(db.Pool, 256)

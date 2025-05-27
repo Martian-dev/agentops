@@ -26,6 +26,7 @@ const (
 	NodeStatusSuccess  NodeStatus = "success"
 	NodeStatusFailed   NodeStatus = "failed"
 	NodeStatusRetrying NodeStatus = "retrying"
+	NodeStatusSkipped  NodeStatus = "skipped"
 )
 
 type NodeState struct {
@@ -36,13 +37,18 @@ type NodeState struct {
 }
 
 type TraceEvent struct {
-	NodeID    string    `json:"node_id"`
-	EventType string    `json:"event_type,omitempty"`
-	FromState string    `json:"from_state"`
-	ToState   string    `json:"to_state"`
-	Attempt   int       `json:"attempt,omitempty"`
-	Message   string    `json:"message,omitempty"`
-	At        time.Time `json:"at"`
+	NodeID         string            `json:"node_id"`
+	EventType      string            `json:"event_type,omitempty"`
+	FromState      string            `json:"from_state"`
+	ToState        string            `json:"to_state"`
+	Attempt        int               `json:"attempt,omitempty"`
+	Message        string            `json:"message,omitempty"`
+	At             time.Time         `json:"at"`
+	StateSnapshot  map[string]string `json:"state_snapshot,omitempty"`
+	OutputPreview  string            `json:"output_preview,omitempty"`
+	InputsUsed     map[string]string `json:"inputs_used,omitempty"`
+	DurationMs     int64             `json:"duration_ms,omitempty"`
+	IdempotencyKey string            `json:"idempotency_key,omitempty"`
 }
 
 // ToolRouter executes a named tool with resolved inputs.
@@ -62,10 +68,10 @@ type Executor struct {
 	MaxRetries   int
 
 	// Guardrails
-	tokenCount      int64 // accessed atomically
-	maxTokenBudget  int64
+	tokenCount       int64 // accessed atomically
+	maxTokenBudget   int64
 	piiFilterEnabled bool
-	cancelRun       context.CancelFunc
+	cancelRun        context.CancelFunc
 }
 
 func NewExecutor(toolRouter ToolRouter, traceEmitter TraceEmitter) *Executor {
@@ -98,7 +104,21 @@ func (e *Executor) TokensUsed() int64 {
 	return atomic.LoadInt64(&e.tokenCount)
 }
 
+// Execute runs a DAG plan using the immutable StateStore. State transitions
+// are recorded as StateDelta entries rather than direct map mutations.
+// Returns the legacy map[string]*NodeState for backward compatibility plus
+// the enriched ExecutionResult via ExecuteWithResult.
 func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (map[string]*NodeState, error) {
+	result, err := e.ExecuteWithResult(ctx, runID, plan, nil)
+	if result == nil {
+		return nil, err
+	}
+	return result.FinalStates, err
+}
+
+// ExecuteWithResult runs a DAG plan and returns the full ExecutionResult
+// including state deltas, snapshots, and checkpoint data.
+func (e *Executor) ExecuteWithResult(ctx context.Context, runID string, plan *DAGPlan, checkpoint *Checkpoint) (*ExecutionResult, error) {
 	if e == nil {
 		return nil, fmt.Errorf("executor is nil")
 	}
@@ -128,39 +148,78 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 		maxRetries = defaultMaxRetries
 	}
 
-	states := make(map[string]*NodeState, len(plan.Nodes))
-	for _, node := range plan.Nodes {
-		states[node.ID] = &NodeState{Status: NodeStatusPending}
+	// Initialize the immutable state store
+	var store *StateStore
+	startTier := 0
+	if checkpoint != nil {
+		store = checkpoint.RestoreStateStore()
+		startTier = checkpoint.CompletedTiers
+	} else {
+		store = NewStateStore()
 	}
 
-	var mu sync.RWMutex
+	// Initialize all nodes to pending (if not already in the store from checkpoint)
+	for _, node := range plan.Nodes {
+		if checkpoint == nil || !checkpoint.IsNodeCompleted(node.ID) {
+			// Only set to pending if the node hasn't already been processed
+			if store.NodeLatestStatus(node.ID) == NodeStatusPending {
+				store.Apply(StateDelta{
+					NodeID: node.ID,
+					Status: NodeStatusPending,
+				})
+			}
+		}
+	}
 
 	// Create a cancellable context for token budget enforcement
 	runCtx, cancelRun := context.WithCancel(ctx)
 	e.cancelRun = cancelRun
 	defer cancelRun()
 
-	setState := func(nodeID string, next NodeStatus, output string, nodeErr error, retries int, message string) {
-		mu.Lock()
-		state := states[nodeID]
-		prev := state.Status
-		state.Status = next
-		if output != "" {
-			state.Output = output
+	applyState := func(nodeID string, status NodeStatus, output string, nodeErr error, attempt int, message string, inputsUsed map[string]string, durationMs int64, idempotencyKey string) {
+		errStr := ""
+		if nodeErr != nil {
+			errStr = nodeErr.Error()
 		}
-		state.Err = nodeErr
-		state.RetryCount = retries
-		mu.Unlock()
+
+		prevStatus := store.NodeLatestStatus(nodeID)
+
+		store.Apply(StateDelta{
+			NodeID:         nodeID,
+			Status:         status,
+			Output:         output,
+			Error:          errStr,
+			Attempt:        attempt,
+			InputsUsed:     inputsUsed,
+			DurationMs:     durationMs,
+			IdempotencyKey: idempotencyKey,
+		})
+
+		traceMsg := message
+		if errStr != "" {
+			traceMsg = errStr
+		}
 
 		if e.TraceEmitter != nil {
+			// Build output preview (first 256 chars)
+			preview := output
+			if len(preview) > 256 {
+				preview = preview[:256] + "..."
+			}
+
 			_ = e.TraceEmitter.Emit(ctx, runID, TraceEvent{
-				NodeID:    nodeID,
-				EventType: "",
-				FromState: string(prev),
-				ToState:   string(next),
-				Attempt:   retries,
-				Message:   message,
-				At:        time.Now().UTC(),
+				NodeID:         nodeID,
+				EventType:      "",
+				FromState:      string(prevStatus),
+				ToState:        string(status),
+				Attempt:        attempt,
+				Message:        traceMsg,
+				At:             time.Now().UTC(),
+				StateSnapshot:  store.StatusSnapshot(),
+				OutputPreview:  preview,
+				InputsUsed:     inputsUsed,
+				DurationMs:     durationMs,
+				IdempotencyKey: idempotencyKey,
 			})
 		}
 	}
@@ -170,58 +229,65 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 			return
 		}
 		_ = e.TraceEmitter.Emit(ctx, runID, TraceEvent{
-			NodeID:    nodeID,
-			EventType: eventType,
-			FromState: "",
-			ToState:   "",
-			Attempt:   attempt,
-			Message:   message,
-			At:        time.Now().UTC(),
+			NodeID:        nodeID,
+			EventType:     eventType,
+			FromState:     "",
+			ToState:       "",
+			Attempt:       attempt,
+			Message:       message,
+			At:            time.Now().UTC(),
+			StateSnapshot: store.StatusSnapshot(),
 		})
 	}
 
 	hasFailedDependency := func(node DAGNode) bool {
-		mu.RLock()
-		defer mu.RUnlock()
 		for _, depID := range node.DependsOn {
-			depState, ok := states[depID]
-			if !ok {
-				return true
-			}
-			if depState.Status == NodeStatusFailed {
+			status := store.NodeLatestStatus(depID)
+			if status == NodeStatusFailed || status == NodeStatusSkipped {
 				return true
 			}
 		}
 		return false
 	}
 
-	resolveInputs := func(node DAGNode) (map[string]interface{}, error) {
+	resolveInputs := func(node DAGNode) (map[string]interface{}, map[string]string, error) {
 		resolved := make(map[string]interface{}, len(node.Inputs))
+		rawInputs := make(map[string]string, len(node.Inputs))
 		for k, v := range node.Inputs {
+			rawInputs[k] = v
 			if strings.HasPrefix(v, "$") && strings.HasSuffix(v, ".output") {
 				refID := strings.TrimSuffix(strings.TrimPrefix(v, "$"), ".output")
-				mu.RLock()
-				refState, ok := states[refID]
-				mu.RUnlock()
-				if !ok {
-					return nil, fmt.Errorf("node_id=%s has unknown output reference=%s", node.ID, v)
+				status := store.NodeLatestStatus(refID)
+				if status != NodeStatusSuccess {
+					return nil, nil, fmt.Errorf("node_id=%s references non-success dependency output dependency=%s status=%s", node.ID, refID, status)
 				}
-				if refState.Status != NodeStatusSuccess {
-					return nil, fmt.Errorf("node_id=%s references non-success dependency output dependency=%s status=%s", node.ID, refID, refState.Status)
-				}
-				resolved[k] = refState.Output
+				output := store.NodeOutput(refID)
+				resolved[k] = output
+				rawInputs[k] = v + " -> (resolved)"
 				continue
 			}
 			resolved[k] = v
 		}
-		return resolved, nil
+		return resolved, rawInputs, nil
 	}
 
-	for _, tier := range tiers {
+	var lastCheckpoint *Checkpoint
+
+	for tierIdx, tier := range tiers {
+		// Skip tiers that were already completed in a prior checkpoint
+		if tierIdx < startTier {
+			continue
+		}
+
 		var wg sync.WaitGroup
 		for _, node := range tier {
+			// Skip nodes already completed from checkpoint
+			if checkpoint != nil && checkpoint.IsNodeCompleted(node.ID) {
+				continue
+			}
+
 			if hasFailedDependency(node) {
-				setState(node.ID, NodeStatusFailed, "", fmt.Errorf("skipped due to failed dependency"), 0, "dependency_failed")
+				applyState(node.ID, NodeStatusFailed, "", fmt.Errorf("skipped due to failed dependency"), 0, "dependency_failed", nil, 0, "")
 				continue
 			}
 
@@ -230,19 +296,33 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 			go func() {
 				defer wg.Done()
 
-				inputs, err := resolveInputs(node)
+				inputs, rawInputs, err := resolveInputs(node)
 				if err != nil {
-					setState(node.ID, NodeStatusFailed, "", err, 0, "input_resolution_failed")
+					applyState(node.ID, NodeStatusFailed, "", err, 0, "input_resolution_failed", rawInputs, 0, "")
 					return
+				}
+
+				// Compute idempotency key for this execution
+				idemKey := ComputeIdempotencyKey(node.ID, 0, node.Inputs)
+
+				// Check if we have a cached result from checkpoint
+				if checkpoint != nil {
+					if cachedOutput, ok := checkpoint.LookupIdempotent(idemKey); ok {
+						applyState(node.ID, NodeStatusSuccess, cachedOutput, nil, 0, "idempotent_cache_hit", rawInputs, 0, idemKey)
+						return
+					}
 				}
 
 				nodeCtx := tracectx.WithProviderFallbackHook(runCtx, func(providerErr error) {
 					emitCustomEvent(node.ID, "provider_fallback", 0, providerErr.Error())
 				})
 
+				startTime := time.Now()
 				output, attempts, err := e.runNode(nodeCtx, node, inputs, maxRetries, nodeTimeout, emitCustomEvent)
+				durationMs := time.Since(startTime).Milliseconds()
+
 				if err != nil {
-					setState(node.ID, NodeStatusFailed, "", err, attempts, "failed")
+					applyState(node.ID, NodeStatusFailed, "", err, attempts, "failed", rawInputs, durationMs, idemKey)
 					return
 				}
 
@@ -251,24 +331,36 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 					output = filterPII(output)
 				}
 
-				setState(node.ID, NodeStatusSuccess, output, nil, attempts, "success")
+				applyState(node.ID, NodeStatusSuccess, output, nil, attempts, "success", rawInputs, durationMs, idemKey)
 			}()
 		}
 
 		wg.Wait()
+
+		// Checkpoint after each tier completes
+		tierCheckpoint, cpErr := NewCheckpoint(runID, plan, store, tierIdx+1)
+		if cpErr == nil {
+			lastCheckpoint = tierCheckpoint
+		}
+	}
+
+	// Build final result
+	result := &ExecutionResult{
+		FinalStates: store.Snapshot(),
+		Deltas:      store.AllDeltas(),
+		Checkpoint:  lastCheckpoint,
+		TotalTokens: e.TokensUsed(),
 	}
 
 	var runErr error
-	mu.RLock()
-	for nodeID, state := range states {
+	for nodeID, state := range result.FinalStates {
 		if state.Status == NodeStatusFailed {
 			runErr = fmt.Errorf("execution finished with failures; first_failed_node=%s", nodeID)
 			break
 		}
 	}
-	mu.RUnlock()
 
-	return states, runErr
+	return result, runErr
 }
 
 func (e *Executor) runNode(
