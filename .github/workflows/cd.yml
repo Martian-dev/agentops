@@ -1,0 +1,13 @@
+name: CD
+
+on:
+  workflow_dispatch:
+
+jobs:
+  cd:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Placeholder
+        run: echo "TODO: add CD steps"

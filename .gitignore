@@ -1,0 +1,77 @@
+# ----- OS / Editor -----
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# ----- Secrets / local env -----
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# ----- Logs / temp -----
+*.log
+logs/
+tmp/
+.temp/
+
+# ----- Go (backend) -----
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.so.*
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+
+# Common local binaries used by this project
+/backend/agentops-api
+/backend/main
+
+# Dependencies and tooling cache
+vendor/
+go.work
+
+# ----- Frontend (if/when added) -----
+node_modules/
+.pnpm-store/
+.npm/
+.yarn/
+.yarn/cache/
+.yarn/unplugged/
+.yarn/build-state.yml
+.yarn/install-state.gz
+.next/
+dist/
+build/
+coverage/
+
+# ----- Python artifacts (eval scripts / notebooks) -----
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ----- Docker / compose local overrides -----
+**/.docker/
+**/docker-data/
+
+# ----- Terraform (if infra expands) -----
+.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraform.lock.hcl
