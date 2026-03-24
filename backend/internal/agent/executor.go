@@ -2,10 +2,14 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Martian-dev/agentops/internal/llm/tracectx"
+	"github.com/Martian-dev/agentops/internal/tools"
 )
 
 const (
@@ -32,8 +36,10 @@ type NodeState struct {
 
 type TraceEvent struct {
 	NodeID    string    `json:"node_id"`
+	EventType string    `json:"event_type,omitempty"`
 	FromState string    `json:"from_state"`
 	ToState   string    `json:"to_state"`
+	Attempt   int       `json:"attempt,omitempty"`
 	Message   string    `json:"message,omitempty"`
 	At        time.Time `json:"at"`
 }
@@ -111,12 +117,29 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 		if e.TraceEmitter != nil {
 			_ = e.TraceEmitter.Emit(ctx, runID, TraceEvent{
 				NodeID:    nodeID,
+				EventType: "",
 				FromState: string(prev),
 				ToState:   string(next),
+				Attempt:   retries,
 				Message:   message,
 				At:        time.Now().UTC(),
 			})
 		}
+	}
+
+	emitCustomEvent := func(nodeID, eventType string, attempt int, message string) {
+		if e.TraceEmitter == nil {
+			return
+		}
+		_ = e.TraceEmitter.Emit(ctx, runID, TraceEvent{
+			NodeID:    nodeID,
+			EventType: eventType,
+			FromState: "",
+			ToState:   "",
+			Attempt:   attempt,
+			Message:   message,
+			At:        time.Now().UTC(),
+		})
 	}
 
 	hasFailedDependency := func(node DAGNode) bool {
@@ -169,37 +192,23 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 			go func() {
 				defer wg.Done()
 
-				for attempt := 0; attempt <= maxRetries; attempt++ {
-					if attempt > 0 {
-						setState(node.ID, NodeStatusRetrying, "", nil, attempt, "retrying")
-					}
-
-					setState(node.ID, NodeStatusRunning, "", nil, attempt, "running")
-
-					inputs, err := resolveInputs(node)
-					if err != nil {
-						if attempt < maxRetries {
-							continue
-						}
-						setState(node.ID, NodeStatusFailed, "", err, attempt, "input_resolution_failed")
-						return
-					}
-
-					nodeCtx, cancel := context.WithTimeout(ctx, nodeTimeout)
-					output, err := e.ToolRouter.Execute(nodeCtx, node.Tool, inputs)
-					cancel()
-					if err == nil {
-						setState(node.ID, NodeStatusSuccess, output, nil, attempt, "success")
-						return
-					}
-
-					if attempt < maxRetries {
-						continue
-					}
-
-					setState(node.ID, NodeStatusFailed, "", err, attempt, "failed")
+				inputs, err := resolveInputs(node)
+				if err != nil {
+					setState(node.ID, NodeStatusFailed, "", err, 0, "input_resolution_failed")
 					return
 				}
+
+				nodeCtx := tracectx.WithProviderFallbackHook(ctx, func(providerErr error) {
+					emitCustomEvent(node.ID, "provider_fallback", 0, providerErr.Error())
+				})
+
+				output, attempts, err := e.runNode(nodeCtx, node, inputs, maxRetries, nodeTimeout, emitCustomEvent)
+				if err != nil {
+					setState(node.ID, NodeStatusFailed, "", err, attempts, "failed")
+					return
+				}
+
+				setState(node.ID, NodeStatusSuccess, output, nil, attempts, "success")
 			}()
 		}
 
@@ -217,6 +226,47 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 	mu.RUnlock()
 
 	return states, runErr
+}
+
+func (e *Executor) runNode(
+	ctx context.Context,
+	node DAGNode,
+	resolvedInputs map[string]interface{},
+	retryLimit int,
+	nodeTimeout time.Duration,
+	emitCustomEvent func(nodeID, eventType string, attempt int, message string),
+) (output string, lastAttempt int, err error) {
+	backoff := 500 * time.Millisecond
+
+	for attempt := 0; attempt <= retryLimit; attempt++ {
+		lastAttempt = attempt
+		if attempt > 0 {
+			emitCustomEvent(node.ID, "node_retrying", attempt, "retrying")
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return "", attempt, ctx.Err()
+			}
+			backoff *= 2
+		}
+
+		nodeCtx, cancel := context.WithTimeout(ctx, nodeTimeout)
+		output, err = e.ToolRouter.Execute(nodeCtx, node.Tool, resolvedInputs)
+		cancel()
+		if err == nil {
+			return output, attempt, nil
+		}
+
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return "", attempt, err
+		}
+		var invalidInput *tools.ErrInvalidInput
+		if errors.As(err, &invalidInput) {
+			return "", attempt, err
+		}
+	}
+
+	return "", lastAttempt, fmt.Errorf("node %s failed after %d attempts: %w", node.ID, retryLimit+1, err)
 }
 
 func topoSort(nodes []DAGNode) ([][]DAGNode, error) {

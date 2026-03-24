@@ -3,13 +3,21 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
-	"time"
 )
+
+type fakeLLMClient struct {
+	response string
+	err      error
+}
+
+func (f *fakeLLMClient) Complete(ctx context.Context, systemPrompt, userMessage string, temp float32) (string, int, int, error) {
+	return f.response, 0, 0, f.err
+}
 
 func TestValidateInput_ErrorIncludesFieldPath(t *testing.T) {
 	tool := &Tool{
@@ -94,32 +102,13 @@ func TestDispatchHTTP_PostsJSONAndParsesResponse(t *testing.T) {
 }
 
 func TestDispatchLLM_ReturnsOutputEnvelope(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		if req.Method != http.MethodPost {
-			t.Fatalf("expected POST, got %s", req.Method)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"hello from llm"}}]}`))
-	}))
-	defer srv.Close()
-
-	prevKey := os.Getenv("OPENROUTER_API_KEY")
-	prevURL := os.Getenv("OPENROUTER_BASE_URL")
-	t.Cleanup(func() {
-		_ = os.Setenv("OPENROUTER_API_KEY", prevKey)
-		_ = os.Setenv("OPENROUTER_BASE_URL", prevURL)
-	})
-	_ = os.Setenv("OPENROUTER_API_KEY", "test-key")
-	_ = os.Setenv("OPENROUTER_BASE_URL", srv.URL)
-
 	r := NewRouter(nil, nil)
-	r.llmClient = &http.Client{Timeout: 2 * time.Second}
+	r.SetLLMClient(&fakeLLMClient{response: "hello from llm"})
 	tool := &Tool{
 		Name:        "llm_tool",
 		HandlerType: "llm",
 		HandlerConfig: json.RawMessage(`{
-			"system_prompt": "You are a formatter",
-			"model": "fake-model"
+			"system_prompt": "You are a formatter"
 		}`),
 	}
 
@@ -134,5 +123,25 @@ func TestDispatchLLM_ReturnsOutputEnvelope(t *testing.T) {
 	}
 	if m["output"] != "hello from llm" {
 		t.Fatalf("unexpected llm output: %#v", m)
+	}
+}
+
+func TestDispatchLLM_PropagatesClientError(t *testing.T) {
+	r := NewRouter(nil, nil)
+	r.SetLLMClient(&fakeLLMClient{err: errors.New("provider down")})
+	tool := &Tool{
+		Name:        "llm_tool",
+		HandlerType: "llm",
+		HandlerConfig: json.RawMessage(`{
+			"system_prompt": "You are a formatter"
+		}`),
+	}
+
+	_, err := r.dispatchLLM(context.Background(), tool, map[string]interface{}{"x": 1})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "provider down") {
+		t.Fatalf("expected wrapped provider error, got: %v", err)
 	}
 }
