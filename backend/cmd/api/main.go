@@ -10,6 +10,7 @@ import (
 	"github.com/Martian-dev/agentops/internal/db"
 	"github.com/Martian-dev/agentops/internal/router"
 	"github.com/Martian-dev/agentops/internal/tools"
+	"github.com/Martian-dev/agentops/internal/trace"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 )
@@ -49,11 +50,14 @@ func main() {
 		return map[string]interface{}{"output": a + " " + b}, nil
 	})
 
+	// Create trace emitter for run execution
+	traceEmitter := trace.NewExecutorEmitter(db.Pool, 256)
+
 	// Middleware
 	app.Use(recover.New())
 
 	// Setup routes
-	router.SetupRoutes(app, toolRouter)
+	router.SetupRoutes(app, toolRouter, traceEmitter)
 
 	// Health check for container orchestration
 	app.Get("/healthz", func(c *fiber.Ctx) error {

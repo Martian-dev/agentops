@@ -21,7 +21,7 @@ services:
     container_name: agentops-db-migrate
     volumes:
       - ../backend/migrations:/migrations
-    command: -path /migrations -database "${DATABASE_URL}" up
+    command: -path /migrations -database "postgres://agentops:agentops@postgres:5432/agentops?sslmode=disable" up
     environment:
       DATABASE_URL: postgres://agentops:agentops@postgres:5432/agentops?sslmode=disable
     depends_on:
@@ -51,6 +51,8 @@ services:
       context: ../backend
       dockerfile: Dockerfile
     container_name: agentops-backend
+    env_file:
+      - .env
     depends_on:
       - postgres
       - db-migrate
@@ -67,3 +69,4 @@ volumes:
   postgres_data:
   qdrant_data:
   redis_data:
+

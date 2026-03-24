@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Martian-dev/agentops/internal/llm/tracectx"
@@ -59,15 +60,42 @@ type Executor struct {
 	TraceEmitter TraceEmitter
 	NodeTimeout  time.Duration
 	MaxRetries   int
+
+	// Guardrails
+	tokenCount      int64 // accessed atomically
+	maxTokenBudget  int64
+	piiFilterEnabled bool
+	cancelRun       context.CancelFunc
 }
 
 func NewExecutor(toolRouter ToolRouter, traceEmitter TraceEmitter) *Executor {
 	return &Executor{
-		ToolRouter:   toolRouter,
-		TraceEmitter: traceEmitter,
-		NodeTimeout:  defaultNodeTimeout,
-		MaxRetries:   defaultMaxRetries,
+		ToolRouter:     toolRouter,
+		TraceEmitter:   traceEmitter,
+		NodeTimeout:    defaultNodeTimeout,
+		MaxRetries:     defaultMaxRetries,
+		maxTokenBudget: int64(defaultMaxTokenBudget),
 	}
+}
+
+// NewExecutorWithConfig creates an executor with guardrail settings from model config.
+func NewExecutorWithConfig(toolRouter ToolRouter, traceEmitter TraceEmitter, cfg ModelConfig) *Executor {
+	return &Executor{
+		ToolRouter:       toolRouter,
+		TraceEmitter:     traceEmitter,
+		NodeTimeout:      defaultNodeTimeout,
+		MaxRetries:       defaultMaxRetries,
+		maxTokenBudget:   int64(cfg.MaxTokenBudget),
+		piiFilterEnabled: cfg.PIIFilterEnabled,
+	}
+}
+
+// TokensUsed returns the cumulative token count for this executor run.
+func (e *Executor) TokensUsed() int64 {
+	if e == nil {
+		return 0
+	}
+	return atomic.LoadInt64(&e.tokenCount)
 }
 
 func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (map[string]*NodeState, error) {
@@ -79,6 +107,11 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 	}
 	if plan == nil {
 		return nil, fmt.Errorf("plan is nil")
+	}
+
+	// Guardrail 9c: recursion depth check
+	if GetRecursionDepth(ctx) > maxRecursionDepth {
+		return nil, fmt.Errorf("recursion depth exceeded: depth %d exceeds maximum %d", GetRecursionDepth(ctx), maxRecursionDepth)
 	}
 
 	tiers, err := topoSort(plan.Nodes)
@@ -101,6 +134,11 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 	}
 
 	var mu sync.RWMutex
+
+	// Create a cancellable context for token budget enforcement
+	runCtx, cancelRun := context.WithCancel(ctx)
+	e.cancelRun = cancelRun
+	defer cancelRun()
 
 	setState := func(nodeID string, next NodeStatus, output string, nodeErr error, retries int, message string) {
 		mu.Lock()
@@ -198,7 +236,7 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 					return
 				}
 
-				nodeCtx := tracectx.WithProviderFallbackHook(ctx, func(providerErr error) {
+				nodeCtx := tracectx.WithProviderFallbackHook(runCtx, func(providerErr error) {
 					emitCustomEvent(node.ID, "provider_fallback", 0, providerErr.Error())
 				})
 
@@ -206,6 +244,11 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 				if err != nil {
 					setState(node.ID, NodeStatusFailed, "", err, attempts, "failed")
 					return
+				}
+
+				// Guardrail 9d: PII filter
+				if e.piiFilterEnabled {
+					output = filterPII(output)
 				}
 
 				setState(node.ID, NodeStatusSuccess, output, nil, attempts, "success")
@@ -254,6 +297,19 @@ func (e *Executor) runNode(
 		output, err = e.ToolRouter.Execute(nodeCtx, node.Tool, resolvedInputs)
 		cancel()
 		if err == nil {
+			// Guardrail 9b: token budget check
+			// Estimate tokens from output length (rough heuristic: 1 token ≈ 4 chars)
+			tokenEstimate := len(output) / 4
+			if tokenEstimate < 1 {
+				tokenEstimate = 1
+			}
+			if budgetErr := checkTokenBudget(&e.tokenCount, tokenEstimate, e.maxTokenBudget); budgetErr != nil {
+				emitCustomEvent(node.ID, "token_budget_exceeded", attempt, budgetErr.Error())
+				if e.cancelRun != nil {
+					e.cancelRun()
+				}
+				return "", attempt, budgetErr
+			}
 			return output, attempt, nil
 		}
 

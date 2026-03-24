@@ -64,8 +64,9 @@ func (p *Planner) Plan(ctx context.Context, goal string, tools []Tool) (*DAGPlan
 	}
 
 	type toolPrompt struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		Name        string          `json:"name"`
+		Description string          `json:"description"`
+		InputSchema json.RawMessage `json:"input_schema,omitempty"`
 	}
 	promptTools := make([]toolPrompt, 0, len(tools))
 	for _, t := range tools {
@@ -73,7 +74,11 @@ func (p *Planner) Plan(ctx context.Context, goal string, tools []Tool) (*DAGPlan
 		if t.Description != nil {
 			description = *t.Description
 		}
-		promptTools = append(promptTools, toolPrompt{Name: t.Name, Description: description})
+		promptTools = append(promptTools, toolPrompt{
+			Name:        t.Name, 
+			Description: description,
+			InputSchema: t.InputSchema,
+		})
 	}
 
 	toolJSON, err := json.Marshal(promptTools)
@@ -91,6 +96,7 @@ func (p *Planner) Plan(ctx context.Context, goal string, tools []Tool) (*DAGPlan
 	if raw == "" {
 		return nil, fmt.Errorf("planner provider returned empty content")
 	}
+	raw = stripMarkdownFences(raw)
 
 	var plan DAGPlan
 	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
@@ -98,4 +104,21 @@ func (p *Planner) Plan(ctx context.Context, goal string, tools []Tool) (*DAGPlan
 	}
 
 	return &plan, nil
+}
+
+// stripMarkdownFences removes ```json / ``` wrappers that LLMs sometimes emit
+// despite being instructed to return raw JSON.
+func stripMarkdownFences(s string) string {
+	// Remove opening fence: ```json or ```
+	for _, prefix := range []string{"```json", "```"} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimPrefix(s, prefix)
+			break
+		}
+	}
+	// Remove closing fence
+	if idx := strings.LastIndex(s, "```"); idx != -1 {
+		s = s[:idx]
+	}
+	return strings.TrimSpace(s)
 }

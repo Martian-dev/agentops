@@ -7,14 +7,15 @@ import (
 	"github.com/Martian-dev/agentops/internal/agent"
 	"github.com/Martian-dev/agentops/internal/db"
 	"github.com/Martian-dev/agentops/internal/tools"
+	"github.com/Martian-dev/agentops/internal/trace"
 	"github.com/gofiber/fiber/v2"
 )
 
 // SetupRoutes configures all API routes
-func SetupRoutes(app *fiber.App, toolRouter *tools.Router) {
+func SetupRoutes(app *fiber.App, toolRouter *tools.Router, traceEmitter *trace.ExecutorEmitter) {
 	// API v1 routes
 	v1 := app.Group("/api/v1")
-	agentHandler := agent.NewHandler()
+	agentHandler := agent.NewHandlerWithDeps(db.Pool, toolRouter, traceEmitter)
 	toolHandler := tools.NewAPIHandler(db.Pool, toolRouter)
 
 	// Health check endpoint
@@ -25,6 +26,11 @@ func SetupRoutes(app *fiber.App, toolRouter *tools.Router) {
 	v1.Get("/agents", agentHandler.ListAgents)
 	v1.Get("/agents/:id", agentHandler.GetAgent)
 	v1.Post("/agents/:id/run", agentHandler.RunAgent)
+	v1.Get("/agents/:id/runs", agentHandler.ListAgentRuns)
+
+	// Run endpoints
+	v1.Get("/runs/:id/status", agentHandler.GetRunStatus)
+	v1.Get("/runs/:id/trace", agentHandler.GetRunTrace)
 
 	// Tool registry endpoints
 	v1.Post("/tools", toolHandler.CreateTool)
