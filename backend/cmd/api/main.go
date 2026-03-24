@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
 	"log"
 	"os"
 
 	"github.com/Martian-dev/agentops/internal/agent"
 	"github.com/Martian-dev/agentops/internal/db"
 	"github.com/Martian-dev/agentops/internal/router"
+	"github.com/Martian-dev/agentops/internal/tools"
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 )
@@ -32,11 +35,25 @@ func main() {
 		ErrorHandler: defaultErrorHandler,
 	})
 
+	toolRouter := tools.NewRouter(db.Pool, nil)
+	toolRouter.Register("echo", func(ctx context.Context, inputs map[string]interface{}) (interface{}, error) {
+		msg, ok := inputs["message"].(string)
+		if !ok {
+			return nil, fmt.Errorf("message must be a string")
+		}
+		return map[string]interface{}{"output": msg}, nil
+	})
+	toolRouter.Register("concat", func(ctx context.Context, inputs map[string]interface{}) (interface{}, error) {
+		a, _ := inputs["a"].(string)
+		b, _ := inputs["b"].(string)
+		return map[string]interface{}{"output": a + " " + b}, nil
+	})
+
 	// Middleware
 	app.Use(recover.New())
 
 	// Setup routes
-	router.SetupRoutes(app)
+	router.SetupRoutes(app, toolRouter)
 
 	// Health check for container orchestration
 	app.Get("/healthz", func(c *fiber.Ctx) error {

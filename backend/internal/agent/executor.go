@@ -40,7 +40,7 @@ type TraceEvent struct {
 
 // ToolRouter executes a named tool with resolved inputs.
 type ToolRouter interface {
-	Execute(ctx context.Context, toolName string, inputs map[string]string) (string, error)
+	Execute(ctx context.Context, toolName string, inputs map[string]interface{}) (string, error)
 }
 
 // TraceEmitter records node transition events.
@@ -134,8 +134,8 @@ func (e *Executor) Execute(ctx context.Context, runID string, plan *DAGPlan) (ma
 		return false
 	}
 
-	resolveInputs := func(node DAGNode) (map[string]string, error) {
-		resolved := make(map[string]string, len(node.Inputs))
+	resolveInputs := func(node DAGNode) (map[string]interface{}, error) {
+		resolved := make(map[string]interface{}, len(node.Inputs))
 		for k, v := range node.Inputs {
 			if strings.HasPrefix(v, "$") && strings.HasSuffix(v, ".output") {
 				refID := strings.TrimSuffix(strings.TrimPrefix(v, "$"), ".output")

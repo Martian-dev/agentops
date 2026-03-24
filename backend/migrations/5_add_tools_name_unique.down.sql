@@ -1,0 +1,2 @@
+ALTER TABLE tools
+DROP CONSTRAINT IF EXISTS tools_name_key;

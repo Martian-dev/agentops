@@ -6,14 +6,16 @@ import (
 
 	"github.com/Martian-dev/agentops/internal/agent"
 	"github.com/Martian-dev/agentops/internal/db"
+	"github.com/Martian-dev/agentops/internal/tools"
 	"github.com/gofiber/fiber/v2"
 )
 
 // SetupRoutes configures all API routes
-func SetupRoutes(app *fiber.App) {
+func SetupRoutes(app *fiber.App, toolRouter *tools.Router) {
 	// API v1 routes
 	v1 := app.Group("/api/v1")
 	agentHandler := agent.NewHandler()
+	toolHandler := tools.NewAPIHandler(db.Pool, toolRouter)
 
 	// Health check endpoint
 	v1.Get("/health", healthCheckHandler)
@@ -23,6 +25,14 @@ func SetupRoutes(app *fiber.App) {
 	v1.Get("/agents", agentHandler.ListAgents)
 	v1.Get("/agents/:id", agentHandler.GetAgent)
 	v1.Post("/agents/:id/run", agentHandler.RunAgent)
+
+	// Tool registry endpoints
+	v1.Post("/tools", toolHandler.CreateTool)
+	v1.Get("/tools", toolHandler.ListTools)
+	v1.Get("/tools/:id", toolHandler.GetTool)
+	v1.Put("/tools/:id", toolHandler.UpdateTool)
+	v1.Delete("/tools/:id", toolHandler.DeleteTool)
+	v1.Post("/tools/:id/test", toolHandler.TestTool)
 }
 
 // healthCheckHandler handles GET /api/v1/health

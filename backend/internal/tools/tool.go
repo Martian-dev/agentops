@@ -43,3 +43,16 @@ func (e *ErrInvalidInput) Error() string {
 	}
 	return fmt.Sprintf("invalid input for tool %s: %s", e.ToolName, e.Message)
 }
+
+// ErrInvalidOutput indicates that a tool response failed JSON Schema validation.
+type ErrInvalidOutput struct {
+	ToolName string
+	Message  string
+}
+
+func (e *ErrInvalidOutput) Error() string {
+	if e.Message == "" {
+		return fmt.Sprintf("invalid output for tool: %s", e.ToolName)
+	}
+	return fmt.Sprintf("invalid output for tool %s: %s", e.ToolName, e.Message)
+}

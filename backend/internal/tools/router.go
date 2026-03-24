@@ -44,6 +44,21 @@ func NewRouter(pool *pgxpool.Pool, internalHandlers map[string]ToolHandlerFunc) 
 	}
 }
 
+// Register adds or replaces an internal tool handler by tool name.
+func (r *Router) Register(toolName string, handler ToolHandlerFunc) {
+	if r == nil {
+		return
+	}
+	toolName = strings.TrimSpace(toolName)
+	if toolName == "" || handler == nil {
+		return
+	}
+	if r.internalHandlers == nil {
+		r.internalHandlers = make(map[string]ToolHandlerFunc)
+	}
+	r.internalHandlers[toolName] = handler
+}
+
 // Lookup resolves a tool row by name.
 func (r *Router) Lookup(ctx context.Context, toolName string) (*Tool, error) {
 	if r == nil {
@@ -100,28 +115,45 @@ func (r *Router) Lookup(ctx context.Context, toolName string) (*Tool, error) {
 }
 
 // Execute resolves, validates, and dispatches a tool call.
-func (r *Router) Execute(ctx context.Context, toolName string, inputs map[string]string) (string, error) {
-	tool, err := r.Lookup(ctx, toolName)
-	if err != nil {
-		return "", err
-	}
-
-	payload := toInterfaceMap(inputs)
-	if err := validateInput(tool, payload); err != nil {
-		return "", err
-	}
-
-	result, err := r.dispatch(ctx, tool, payload)
+func (r *Router) Execute(ctx context.Context, toolName string, inputs map[string]interface{}) (string, error) {
+	result, err := r.ExecuteRaw(ctx, toolName, inputs)
 	if err != nil {
 		return "", err
 	}
 
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
-		return "", fmt.Errorf("marshal tool output for %s: %w", tool.Name, err)
+		return "", fmt.Errorf("marshal tool output for %s: %w", toolName, err)
 	}
 
 	return string(resultBytes), nil
+}
+
+// ExecuteRaw resolves, validates, and dispatches a tool call, returning typed output.
+func (r *Router) ExecuteRaw(ctx context.Context, toolName string, inputs map[string]interface{}) (interface{}, error) {
+	tool, err := r.Lookup(ctx, toolName)
+	if err != nil {
+		return nil, err
+	}
+
+	if inputs == nil {
+		inputs = make(map[string]interface{})
+	}
+
+	if err := validateInput(tool, inputs); err != nil {
+		return nil, err
+	}
+
+	result, err := r.dispatch(ctx, tool, inputs)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := validateOutput(tool, result); err != nil {
+		return nil, err
+	}
+
+	return result, nil
 }
 
 func (r *Router) dispatch(ctx context.Context, tool *Tool, inputs map[string]interface{}) (interface{}, error) {
@@ -301,6 +333,32 @@ func validateInput(tool *Tool, inputs map[string]interface{}) error {
 	return nil
 }
 
+func validateOutput(tool *Tool, output interface{}) error {
+	schemaBytes := tool.OutputSchema
+	if len(schemaBytes) == 0 {
+		schemaBytes = json.RawMessage(`{}`)
+	}
+
+	compiler := jsonschema.NewCompiler()
+	if err := compiler.AddResource("tool-output.json", strings.NewReader(string(schemaBytes))); err != nil {
+		return fmt.Errorf("invalid output_schema for tool=%s: %w", tool.Name, err)
+	}
+
+	schema, err := compiler.Compile("tool-output.json")
+	if err != nil {
+		return fmt.Errorf("invalid output_schema for tool=%s: %w", tool.Name, err)
+	}
+
+	if err := schema.Validate(output); err != nil {
+		return &ErrInvalidOutput{
+			ToolName: tool.Name,
+			Message:  formatValidationError(err),
+		}
+	}
+
+	return nil
+}
+
 func formatValidationError(err error) string {
 	var vErr *jsonschema.ValidationError
 	if !errors.As(err, &vErr) {
@@ -334,10 +392,3 @@ func flattenValidationErrors(vErr *jsonschema.ValidationError) []string {
 	return out
 }
 
-func toInterfaceMap(inputs map[string]string) map[string]interface{} {
-	out := make(map[string]interface{}, len(inputs))
-	for k, v := range inputs {
-		out[k] = v
-	}
-	return out
-}
